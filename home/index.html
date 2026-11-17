@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home · Opus Revenue Desk</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%231c5cab%22/%3E%3Ctext x=%2216%22 y=%2222%22 font-size=%2218%22 font-family=%22Arial%22 font-weight=%22700%22 fill=%22white%22 text-anchor=%22middle%22%3EO%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/shared/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <script src="/shared/app.js"></script>
+</head>
+<body>
+<main class="wrap" id="main"><div class="empty"><b>Loading…</b></div></main>
+<script>
+(function () {
+  'use strict';
+  const { h, fmt } = ORD;
+  const D = ORD.date;
+  const main = document.getElementById('main');
+  const TABS = [['upload', 'Upload'], ['rates', 'Rates'], ['ratings', 'OTA ratings'], ['rooms', 'Room types'], ['settings', 'Settings']];
+  const KIND_LABEL = {
+    ezee_daily: 'eZee Monthly Statistics',
+    ezee_reservations: 'eZee reservation list',
+    lighthouse_rates: 'Lighthouse Rate Insight',
+    lighthouse_demand: 'Lighthouse Market Insight',
+  };
+  let tab = (location.hash || '').slice(1);
+  if (!TABS.some(([k]) => k === tab)) tab = 'upload';
+  let prop = ORD.store.get('ord.prop');
+  let panel, uploadLogEl = null;
+
+  ORD.boot({ page: 'home', main, onReady: render });
+
+  function setProp(code) { prop = code; ORD.store.set('ord.prop', code); }
+
+  function render() {
+    if (!ORD.propByCode[prop]) setProp(ORD.properties[0].code);
+    const tabs = h('div', { class: 'tabs', role: 'tablist' }, TABS.map(([k, label]) =>
+      h('button', { role: 'tab', 'aria-selected': String(k === tab), id: 'tab-' + k, onclick: () => { tab = k; history.replaceState(null, '', '#' + k); render(); } }, label)));
+    panel = h('section', { role: 'tabpanel', 'aria-labelledby': 'tab-' + tab });
+    ORD.fill(main, 
+      h('div', { class: 'page-head' }, h('div', null,
+        h('h1', null, 'Home'),
+        h('p', null, 'Upload the latest exports, review recommended rates, and keep ratings and room types up to date.'))),
+      tabs, panel);
+    ({ upload: renderUpload, rates: renderRates, ratings: renderRatings, rooms: renderRooms, settings: renderSettings })[tab](panel);
+  }
+
+  const errBox = (e) => h('div', { class: 'callout bad' }, 'Something went wrong: ' + (e && e.message ? e.message : e));
+  const field = (label, control, id) => { if (id) control.id = id; return h('label', { class: 'field', for: id || null }, label, control); };
+  const monthValue = (iso) => iso.slice(0, 7);
+  const monthIso = (v) => (v && /^\d{4}-\d{2}$/.test(v) ? v + '-01' : null);
+
+  async function logUpload(kind, code, fileName, n) {
+    try { await ORD.db.from('uploads').insert({ kind, property_code: code, file_name: fileName, row_count: n }); } catch (e) { /* log only */ }
+  }
+
+  function previewTable(headers, rows) {
+    return h('div', { class: 'preview' }, h('table', null,
+      h('thead', null, h('tr', null, headers.map((x) => h('th', { text: x })))),
+      h('tbody', null, rows.map((r) => h('tr', null, r.map((c) => h('td', { text: c == null ? '' : String(c) })))))));
+  }
+
+  /* =================================================================
+     UPLOAD
+     ================================================================= */
+  function renderUpload(root) {
+    const input = h('input', { type: 'file', multiple: true, accept: '.xlsx,.xls,.csv', class: 'hidden', id: 'file-input' });
+    const drop = h('div', { class: 'drop', tabindex: '0', role: 'button', 'aria-label': 'Choose files to upload' },
+      h('h2', null, 'Drop eZee or Lighthouse files here'),
+      h('p', { class: 'muted', style: { margin: '6px 0 0' } }, 'or click to choose · .xlsx, .xls or .csv · several at once is fine'),
+      h('p', { class: 'small muted', style: { margin: '10px 0 0' } },
+        'Recognised: eZee Monthly Statistics · eZee reservation list · Lighthouse Rate Insight · Lighthouse Market Insight'));
+    const files = h('div', { id: 'file-cards', style: { marginTop: '16px' } });
+    const importAll = h('button', { class: 'btn primary hidden', id: 'import-all' }, 'Import all');
+    const log = h('div');
+    uploadLogEl = log;
+
+    drop.addEventListener('click', () => input.click());
+    drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } });
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); addFiles([...e.dataTransfer.files]); });
+    input.addEventListener('change', () => { const picked = [...input.files]; input.value = ''; addFiles(picked); });
+    importAll.addEventListener('click', async () => {
+      importAll.disabled = true;
+      for (const btn of files.querySelectorAll('button[data-import]:not(:disabled)')) { await btn.onImport(); }
+      importAll.disabled = false;
+    });
+
+    async function addFiles(list) {
+      for (const file of list) {
+        const card = h('div', { class: 'file-card' }, h('b', { text: file.name }), h('span', { class: 'muted' }, ' — reading…'));
+        files.append(card);
+        try {
+          const rows = await ORD.readWorkbook(file);
+          if (!rows.length) throw new Error('The file is empty.');
+          buildFileCard(card, file, rows, ORD.detectKind(rows));
+        } catch (e) {
+          ORD.fill(card, h('b', { text: file.name }), errBox(e));
+        }
+      }
+      importAll.classList.toggle('hidden', files.querySelectorAll('button[data-import]').length < 2);
+    }
+
+    root.append(
+      h('div', { class: 'card' }, drop, h('div', { class: 'row', style: { justifyContent: 'flex-end', marginTop: '12px' } }, importAll), files),
+      h('div', { class: 'card', style: { marginTop: '16px' } },
+        h('div', { class: 'card-head' }, h('div', null, h('h2', null, 'Recent uploads'), h('p', null, 'Uploading the same file again updates the rows instead of duplicating them.'))),
+        log),
+      input);
+    loadLog(log);
+  }
+
+  async function loadLog(el) {
+    try {
+      const rows = await ORD.q(ORD.db.from('uploads').select('*').order('uploaded_at', { ascending: false }).limit(15));
+      if (!rows.length) { ORD.fill(el, ORD.empty('No uploads yet', 'The dashboard is showing sample data until you upload your own files.')); return; }
+      ORD.fill(el, h('div', { class: 'table-wrap' }, h('table', null,
+        h('thead', null, h('tr', null, ['When', 'File', 'Type', 'Hotel', 'Rows'].map((x) => h('th', { text: x })))),
+        h('tbody', null, rows.map((r) => h('tr', null,
+          h('td', { text: new Date(r.uploaded_at).toLocaleString('en-MY', { dateStyle: 'medium', timeStyle: 'short' }) }),
+          h('td', { text: r.file_name || '' }),
+          h('td', { text: KIND_LABEL[r.kind] || r.kind }),
+          h('td', { text: r.property_code ? (ORD.propByCode[r.property_code] || {}).name || r.property_code : 'All (KL market)' }),
+          h('td', { class: 'num', text: fmt.int(r.row_count) })))))));
+    } catch (e) { ORD.fill(el, errBox(e)); }
+  }
+
+  function buildFileCard(card, file, rows, kind) {
+    const kindSel = h('select', { 'aria-label': 'File type' }, Object.entries(KIND_LABEL).map(([k, l]) => h('option', { value: k }, l)));
+    kindSel.value = kind;
+    const remove = h('button', { class: 'btn small', onclick: () => card.remove() }, 'Remove');
+    const body = h('div');
+    const status = h('div', { class: 'msg', role: 'status' });
+    const importBtn = h('button', { class: 'btn primary', 'data-import': '' }, 'Import');
+    ORD.fill(card, 
+      h('div', { class: 'row', style: { justifyContent: 'space-between' } },
+        h('div', { class: 'row' }, h('b', { text: file.name }), kindSel),
+        remove),
+      body,
+      h('div', { class: 'row', style: { marginTop: '12px' } }, importBtn, status));
+
+    let ctx = null;
+    const draw = () => {
+      status.textContent = ''; status.className = 'msg';
+      importBtn.disabled = false; importBtn.textContent = 'Import';
+      try {
+        ctx = ({ ezee_daily: cardEzeeDaily, ezee_reservations: cardReservations, lighthouse_rates: cardRates, lighthouse_demand: cardDemand })[kindSel.value](body, file, rows);
+      } catch (e) {
+        ctx = null; ORD.fill(body, errBox(e)); importBtn.disabled = true;
+      }
+    };
+    kindSel.addEventListener('change', draw);
+    importBtn.onImport = async () => {
+      if (!ctx) return;
+      importBtn.disabled = true; status.className = 'msg'; status.textContent = 'Importing…';
+      try {
+        const n = await ctx.importRows();
+        status.className = 'msg ok'; status.textContent = `Imported ${fmt.int(n)} rows ✓`;
+        importBtn.textContent = 'Imported';
+        ORD.toast(`${file.name}: ${fmt.int(n)} rows saved.`);
+        if (uploadLogEl && uploadLogEl.isConnected) loadLog(uploadLogEl);
+      } catch (e) {
+        status.className = 'msg err'; status.textContent = e.message; importBtn.disabled = false;
+      }
+    };
+    importBtn.addEventListener('click', importBtn.onImport);
+    draw();
+  }
+
+  /* ---------- eZee Monthly Statistics ---------- */
+  function cardEzeeDaily(body, file, rows) {
+    const parsed = ORD.parseEzeeDaily(rows, file.name);
+    const propSel = ORD.propertySelect(null, parsed.propertyCode || prop);
+    const month = h('input', { type: 'month', value: parsed.month ? monthValue(parsed.month) : monthValue(D.today()) });
+    const t = parsed.total;
+    ORD.fill(body, 
+      parsed.propertyCode ? null : h('div', { class: 'callout warn', style: { marginTop: '10px' } }, 'Hotel not recognised from the file — pick it below.'),
+      ...parsed.warnings.map((w) => h('div', { class: 'callout warn', style: { marginTop: '10px' } }, w)),
+      h('div', { class: 'row', style: { marginTop: '10px' } }, field('Hotel', propSel), field('Month', month),
+        h('div', { class: 'small ink2', style: { alignSelf: 'flex-end', paddingBottom: '8px' } },
+          `${parsed.days.length} days found`,
+          t ? ` · eZee total: Occ ${fmt.pct(t.occ, 2)} · ADR ${fmt.rm2(t.adr)} · RevPAR ${fmt.rm2(t.revpar)}` : '')),
+      previewTable(['Day', 'Available', 'Sold', 'Comp', 'Occ %', 'ADR', 'RevPAR', 'Room charges'],
+        parsed.days.map((d) => [d.day, d.available_rooms, d.nights_sold, d.complimentary, d.occupancy_pct, d.adr, d.revpar, d.room_charges])));
+    if (!parsed.days.length) throw new Error('No daily rows found under the header.');
+    return {
+      async importRows() {
+        const m = monthIso(month.value);
+        if (!m) throw new Error('Pick the month first.');
+        const out = ORD.buildEzeeDailyRows(parsed, propSel.value, m, file.name);
+        await ORD.upsertChunks('daily_stats', out, 'property_code,stay_date');
+        await logUpload('ezee_daily', propSel.value, file.name, out.length);
+        return out.length;
+      },
+    };
+  }
+
+  /* ---------- eZee reservation list ---------- */
+  function cardReservations(body, file, rows) {
+    const t = ORD.analyzeTable(rows, ['arrival', 'departure', 'room_type', 'nationality', 'room_revenue', 'res_no', 'nights']);
+    const order = ['room_type', 'arrival', 'departure', 'nights', 'nationality', 'business_source', 'status', 'booking_date', 'res_no', 'room_revenue'];
+    let map = ORD.autoMap(t.headers, order);
+    const saved = ORD.savedMapping('ezee_reservations', t.signature);
+    if (saved) {
+      map = {};
+      for (const [k, name] of Object.entries(saved)) { const i = t.headers.indexOf(name); if (i >= 0) map[k] = i; }
+    }
+    const titleText = rows.slice(0, Math.max(1, t.hdrIdx)).flat().filter((c) => typeof c === 'string').join(' ');
+    const propSel = ORD.propertySelect(null, ORD.guessProperty(titleText + ' ' + file.name) || prop, () => update());
+    const perNight = h('input', { type: 'checkbox' });
+    const selects = {};
+    const mapGrid = h('div', { class: 'map-grid' }, ORD.RES_FIELDS.map((f) => {
+      const s = h('select', null, h('option', { value: '' }, '— not in file —'), t.headers.map((x, i) => h('option', { value: String(i) }, x)));
+      s.value = map[f.key] != null ? String(map[f.key]) : '';
+      s.addEventListener('change', update);
+      selects[f.key] = s;
+      return field(f.label + (f.required ? ' *' : f.hint ? ` (${f.hint})` : ''), s);
+    }));
+    const info = h('div');
+    const prev = h('div');
+    ORD.fill(body, 
+      h('div', { class: 'row', style: { marginTop: '10px' } }, field('Hotel', propSel),
+        h('label', { class: 'row small ink2', style: { alignSelf: 'flex-end', paddingBottom: '8px' } }, perNight, 'Revenue column is a per-night rate')),
+      h('p', { class: 'small muted', style: { margin: '10px 0 0' } }, 'Match the columns below. Only these fields are saved — guest names, emails and phone numbers are never stored.'),
+      mapGrid, info, prev);
+    perNight.addEventListener('change', update);
+
+    let built = { rows: [], skipped: 0 };
+    function currentMap() { const m = {}; for (const [k, s] of Object.entries(selects)) if (s.value !== '') m[k] = +s.value; return m; }
+    function update() {
+      const m = currentMap();
+      const missing = ORD.RES_FIELDS.filter((f) => f.required && m[f.key] == null).map((f) => f.label);
+      if (m.departure == null && m.nights == null) missing.push('Departure date or Nights');
+      if (missing.length) {
+        built = { rows: [], skipped: 0 };
+        ORD.fill(info, h('div', { class: 'callout warn' }, 'Still needed: ' + missing.join(', ')));
+        ORD.fill(prev);
+        return;
+      }
+      built = ORD.buildReservations(t, m, { propertyCode: propSel.value, perNight: perNight.checked, fileName: file.name });
+      const known = new Set(ORD.roomTypesFor(propSel.value).map((r) => ORD.norm(r.name)));
+      const unknown = [...new Set(built.rows.map((r) => r.room_type))].filter((n) => !known.has(ORD.norm(n)));
+      ORD.fill(info, 
+        h('p', { class: 'small ink2', style: { margin: '4px 0' } }, `${fmt.int(built.rows.length)} booking${built.rows.length === 1 ? '' : 's'} ready · ${fmt.int(built.skipped)} row${built.skipped === 1 ? '' : 's'} skipped (no valid dates, room type or revenue — e.g. a Total line)`),
+        unknown.length ? h('div', { class: 'callout warn' }, `Room types not set up for ${ORD.propByCode[propSel.value].name}: ${unknown.slice(0, 6).join(', ')}${unknown.length > 6 ? '…' : ''}. They still count on the dashboard; add them in Room types to get rate recommendations.`) : null);
+      ORD.fill(prev, previewTable(['Arrival', 'Departure', 'Nights', 'Room type', 'Nationality', 'Source', 'Status', 'Revenue'],
+        built.rows.slice(0, 12).map((r) => [r.arrival, r.departure, D.diff(r.arrival, r.departure), r.room_type, r.nationality, r.business_source, r.status, fmt.rm2(r.room_revenue)])));
+    }
+    update();
+    return {
+      async importRows() {
+        if (!built.rows.length) throw new Error('Nothing to import — check the column matching.');
+        built.rows.forEach((r) => { r.property_code = propSel.value; });
+        await ORD.upsertChunks('reservations', built.rows, 'property_code,res_key');
+        const m = currentMap(), named = {};
+        for (const [k, i] of Object.entries(m)) named[k] = t.headers[i];
+        ORD.saveMapping('ezee_reservations', t.signature, named);
+        await logUpload('ezee_reservations', propSel.value, file.name, built.rows.length);
+        return built.rows.length;
+      },
+    };
+  }
+
+  /* ---------- Lighthouse Rate Insight ---------- */
+  function cardRates(body, file, rows) {
+    const topText = rows.slice(0, 3).flat().filter((c) => typeof c === 'string').join(' ');
+    const propSel = ORD.propertySelect(null, ORD.guessProperty(file.name + ' ' + topText) || prop, () => { a = ORD.analyzeRates(rows, propSel.value); drawControls(); });
+    const snap = h('input', { type: 'date', value: ORD.guessSnapshotDate(file.name, rows) });
+    let a = ORD.analyzeRates(rows, propSel.value);
+    const controls = h('div');
+    const prev = h('div');
+    ORD.fill(body, 
+      h('div', { class: 'row', style: { marginTop: '10px' } }, field('Competitor set for', propSel), field('Rates shopped on (snapshot date)', snap)),
+      controls, prev);
+    snap.addEventListener('change', update);
+
+    let cfg = {};
+    function colSelect(value, allowNone) {
+      const s = h('select', null, allowNone ? h('option', { value: '-1' }, '— none —') : null, a.headers.map((x, i) => h('option', { value: String(i) }, x)));
+      s.value = String(value);
+      s.addEventListener('change', update);
+      return s;
+    }
+    function drawControls() {
+      const layout = h('select', null, h('option', { value: 'wide' }, 'One column per hotel'), h('option', { value: 'long' }, 'One row per hotel (Hotel + Rate columns)'));
+      layout.value = a.layout;
+      const dateSel = colSelect(a.dateCol);
+      cfg = { layout: a.layout, dateCol: a.dateCol, hotelCols: a.hotelCols.slice(), ownCol: a.ownCol, hotelCol: a.hotelCol, rateCol: a.rateCol, channelCol: a.channelCol, ownName: a.ownName };
+      const specific = h('div');
+      const drawSpecific = () => {
+        if (cfg.layout === 'wide') {
+          ORD.fill(specific, 
+            h('p', { class: 'small muted', style: { margin: '8px 0 4px' } }, 'Tick the hotel columns to import and mark which one is your hotel.'),
+            h('div', { class: 'table-wrap' }, h('table', null,
+              h('thead', null, h('tr', null, h('th', null, 'Import'), h('th', null, 'Column'), h('th', null, 'Your hotel'))),
+              h('tbody', null, a.headers.map((name, i) => {
+                if (i === cfg.dateCol) return null;
+                const inc = h('input', { type: 'checkbox', checked: cfg.hotelCols.includes(i), 'aria-label': 'Import ' + name });
+                const own = h('input', { type: 'radio', name: 'own-' + file.name, checked: i === +cfg.ownCol, 'aria-label': name + ' is my hotel' });
+                inc.addEventListener('change', () => { cfg.hotelCols = inc.checked ? [...cfg.hotelCols, i] : cfg.hotelCols.filter((x) => x !== i); update(); });
+                own.addEventListener('change', () => { cfg.ownCol = i; if (!cfg.hotelCols.includes(i)) { cfg.hotelCols.push(i); inc.checked = true; } update(); });
+                return h('tr', null, h('td', null, inc), h('td', { text: name }), h('td', null, own));
+              })))));
+        } else {
+          const hotelSel = colSelect(cfg.hotelCol), rateSel = colSelect(cfg.rateCol), chSel = colSelect(cfg.channelCol, true);
+          const names = cfg.hotelCol >= 0 ? [...new Set(a.body.map((r) => String(r[cfg.hotelCol] || '').trim()).filter(Boolean))] : [];
+          const ownSel = h('select', null, names.map((n) => h('option', { value: n }, n)));
+          if (names.includes(cfg.ownName)) ownSel.value = cfg.ownName; else cfg.ownName = names[0] || '';
+          hotelSel.addEventListener('change', () => { cfg.hotelCol = +hotelSel.value; drawSpecific(); });
+          rateSel.addEventListener('change', () => { cfg.rateCol = +rateSel.value; });
+          chSel.addEventListener('change', () => { cfg.channelCol = +chSel.value; });
+          ownSel.addEventListener('change', () => { cfg.ownName = ownSel.value; update(); });
+          ORD.fill(specific, h('div', { class: 'map-grid' }, field('Hotel column', hotelSel), field('Rate column', rateSel), field('Channel column (optional)', chSel), field('Your hotel in this file', ownSel)));
+        }
+        update();
+      };
+      layout.addEventListener('change', () => { cfg.layout = layout.value; drawSpecific(); });
+      dateSel.addEventListener('change', () => { cfg.dateCol = +dateSel.value; drawSpecific(); });
+      ORD.fill(controls, h('div', { class: 'map-grid' }, field('Layout', layout), field('Stay date column', dateSel)), specific);
+      drawSpecific();
+    }
+    let built = { rows: [], skipped: 0 };
+    function update() {
+      if (!snap.value) { ORD.fill(prev, h('div', { class: 'callout warn' }, 'Pick the snapshot date.')); built = { rows: [] }; return; }
+      built = ORD.buildRates(a, cfg, { propertyCode: propSel.value, snapshotDate: snap.value });
+      const hotels = [...new Set(built.rows.map((r) => r.hotel_name))];
+      const dates = [...new Set(built.rows.map((r) => r.stay_date))].sort();
+      const own = built.rows.find((r) => r.is_own);
+      const by = {};
+      built.rows.forEach((r) => { (by[r.stay_date] = by[r.stay_date] || {})[r.hotel_name] = r.is_sold_out ? 'Sold out' : r.rate; });
+      ORD.fill(prev, 
+        h('p', { class: 'small ink2', style: { margin: '8px 0 0' } },
+          `${fmt.int(built.rows.length)} rates · ${hotels.length} hotels · ${dates.length ? fmt.dayShort(dates[0]) + ' – ' + fmt.dateLong(dates[dates.length - 1]) : 'no dates'} · your hotel: ${own ? own.hotel_name : 'not set'}`),
+        own ? null : h('div', { class: 'callout warn', style: { marginTop: '8px' } }, 'Mark which hotel is yours so the tool can compare.'),
+        previewTable(['Date', ...hotels], dates.slice(0, 10).map((d) => [d, ...hotels.map((x) => (by[d] || {})[x])])));
+    }
+    drawControls();
+    return {
+      async importRows() {
+        if (!built.rows.length) throw new Error('Nothing to import — check the columns.');
+        built.rows.forEach((r) => { r.property_code = propSel.value; });
+        await ORD.upsertChunks('competitor_rates', built.rows, 'property_code,snapshot_date,stay_date,hotel_name,channel');
+        await logUpload('lighthouse_rates', propSel.value, file.name, built.rows.length);
+        return built.rows.length;
+      },
+    };
+  }
+
+  /* ---------- Lighthouse Market Insight ---------- */
+  function cardDemand(body, file, rows) {
+    const a = ORD.analyzeDemand(rows);
+    const snap = h('input', { type: 'date', value: ORD.guessSnapshotDate(file.name, rows) });
+    const sel = (v, none) => { const s = h('select', null, none ? h('option', { value: '-1' }, '— none —') : null, a.headers.map((x, i) => h('option', { value: String(i) }, x))); s.value = String(v); s.addEventListener('change', update); return s; };
+    const dateSel = sel(a.dateCol), demSel = sel(a.demandCol, true), priceSel = sel(a.priceCol, true);
+    const prev = h('div');
+    snap.addEventListener('change', update);
+    ORD.fill(body, 
+      h('p', { class: 'small muted', style: { margin: '10px 0 0' } }, 'KL market demand applies to all three hotels.'),
+      h('div', { class: 'map-grid' }, field('Snapshot date', snap), field('Stay date column', dateSel), field('Demand column', demSel), field('Market price column (optional)', priceSel)),
+      prev);
+    let built = { rows: [] };
+    function update() {
+      const cfg = { dateCol: +dateSel.value, demandCol: +demSel.value, priceCol: +priceSel.value };
+      if (cfg.demandCol < 0) { ORD.fill(prev, h('div', { class: 'callout warn' }, 'Pick the demand column.')); built = { rows: [] }; return; }
+      if (!snap.value) { ORD.fill(prev, h('div', { class: 'callout warn' }, 'Pick the snapshot date.')); built = { rows: [] }; return; }
+      built = ORD.buildDemand(a, cfg, { snapshotDate: snap.value });
+      const rs = built.rows.slice().sort((x, y) => (x.stay_date < y.stay_date ? -1 : 1));
+      ORD.fill(prev, 
+        h('p', { class: 'small ink2', style: { margin: '8px 0 0' } }, `${fmt.int(rs.length)} dates${rs.length ? ' · ' + fmt.dayShort(rs[0].stay_date) + ' – ' + fmt.dateLong(rs[rs.length - 1].stay_date) : ''} · ${fmt.int(built.skipped)} rows skipped`),
+        previewTable(['Date', 'Demand %', 'Market price'], rs.slice(0, 12).map((r) => [r.stay_date, r.demand_pct, r.market_adr])));
+    }
+    update();
+    return {
+      async importRows() {
+        if (!built.rows.length) throw new Error('Nothing to import — check the columns.');
+        await ORD.upsertChunks('market_demand', built.rows, 'area,snapshot_date,stay_date');
+        await logUpload('lighthouse_demand', null, file.name, built.rows.length);
+        return built.rows.length;
+      },
+    };
+  }
+
+  /* =================================================================
+     RATES
+     ================================================================= */
+  function renderRates(root) {
+    const propSel = ORD.propertySelect('rates-prop', prop, (v) => { setProp(v); load(); });
+    const start = h('input', { type: 'date', id: 'rates-start', value: D.today() });
+    const horizon = h('select', { id: 'rates-days' }, [30, 60, 90].map((n) => h('option', { value: String(n) }, n + ' days')));
+    horizon.value = String(ORD.RULES.horizonDays);
+    const exportBtn = h('button', { class: 'btn', disabled: true }, 'Export CSV');
+    const out = h('div');
+    start.addEventListener('change', load);
+    horizon.addEventListener('change', load);
+    root.append(
+      h('div', { class: 'filters' }, field('Hotel', propSel), field('From', start), field('Show', horizon), exportBtn),
+      out);
+    let recs = null;
+    exportBtn.addEventListener('click', () => {
+      if (recs) ORD.download(`rate-recommendations-${recs.property.code.toLowerCase()}-${recs.dates[0]}.csv`, ORD.recsToCsv(recs));
+    });
+
+    async function load() {
+      out.style.opacity = '0.5';
+      try {
+        const s = start.value || D.today();
+        const days = +horizon.value;
+        const inputs = await ORD.loadRateInputs(propSel.value, s, D.add(s, days - 1));
+        recs = ORD.computeRecommendations(propSel.value, inputs, s, days);
+        if (recs.error) { ORD.fill(out, h('div', { class: 'card' }, ORD.empty('No recommendations', recs.error))); exportBtn.disabled = true; return; }
+        exportBtn.disabled = false;
+        drawGrid(out, recs);
+      } catch (e) {
+        ORD.fill(out, errBox(e));
+      } finally {
+        out.style.opacity = '';
+      }
+    }
+    load();
+  }
+
+  function drawGrid(out, recs) {
+    const n = recs.dates.length;
+    const missDemand = recs.meta.filter((m) => m.demand == null).length;
+    const missComp = recs.meta.filter((m) => m.median == null).length;
+    const missOcc = recs.meta.filter((m) => m.occ == null).length;
+    const notes = [];
+    if (missDemand) notes.push(`no KL demand for ${missDemand} of ${n} dates`);
+    if (missComp) notes.push(`no competitor rates for ${missComp} of ${n} dates`);
+    if (missOcc) notes.push(`no occupancy on the books for ${missOcc} of ${n} dates`);
+    const reason = h('div', { class: 'card reason-panel' }, h('p', { class: 'muted', style: { margin: 0 } }, 'Click any rate to see how it was worked out.'));
+
+    const wk = (d) => [5, 6].includes(D.dow(d));
+    const metaRow = (label, fn) => h('tr', { class: 'meta' }, h('th', { class: 'rt' }, label), recs.meta.map((m) => h('th', { text: fn(m) })));
+    const table = h('table', { class: 'rates' },
+      h('thead', null,
+        h('tr', null, h('th', { class: 'rt' }, 'Room type'), recs.dates.map((d) => h('th', { class: wk(d) ? 'wknd' : null, text: fmt.day(d) }))),
+        metaRow('KL demand', (m) => (m.demand == null ? '—' : Math.round(m.demand) + '%')),
+        metaRow('On the books', (m) => (m.occ == null ? '—' : Math.round(m.occ) + '%')),
+        metaRow('Compset median', (m) => (m.median == null ? '—' : fmt.rm(m.median))),
+        metaRow('Your rate now (Lighthouse)', (m) => (m.own == null ? '—' : fmt.rm(m.own)))),
+      h('tbody', null, recs.rows.map((row) => h('tr', null,
+        h('th', { class: 'rt' }, h('div', null, h('b', { text: row.roomType.name })),
+          h('div', { class: 'small muted', text: `Base ${fmt.rm(row.roomType.base_rate)} · ${fmt.rm(row.roomType.min_rate)}–${fmt.rm(row.roomType.max_rate)}` + (row.roomType.id === recs.lead.id ? ' · compared with compset' : '') })),
+        row.cells.map((c) => {
+          const cls = 'cell' + (c.change > 0.005 ? ' up' : c.change < -0.005 ? ' down' : '');
+          const td = h('td', { class: cls, tabindex: '0', title: c.reasons.join('\n') },
+            h('b', { text: fmt.rm(c.rate) }), h('span', { text: fmt.signed(c.change) }));
+          const show = () => {
+            table.querySelectorAll('td.sel').forEach((x) => x.classList.remove('sel'));
+            td.classList.add('sel');
+            ORD.fill(reason, 
+              h('h3', null, `${row.roomType.name} · ${fmt.day(c.date)} ${D.parts(c.date).y}: ${fmt.rm(c.rate)} (${fmt.signed(c.change)} vs base ${fmt.rm(c.base)})`),
+              h('ul', null, c.reasons.map((r) => h('li', { text: r }))),
+              c.missing.length ? h('p', { class: 'small muted', style: { marginTop: '6px' } }, 'No data for: ' + c.missing.join(', ') + ' — that step was skipped.') : null);
+          };
+          td.addEventListener('click', show);
+          td.addEventListener('keydown', (e) => { if (e.key === 'Enter') show(); });
+          return td;
+        })))));
+
+    const premiumTxt = recs.gap == null ? 'no OTA ratings entered yet, so the standard +3% premium applies'
+      : `your average OTA rating is ${recs.gap >= 0 ? '+' : ''}${recs.gap.toFixed(2)} vs the compset, so ${recs.lead.name} may sit up to ${fmt.signed(recs.premium)} vs the compset median`;
+    ORD.fill(out, 
+      h('div', { class: 'callout' }, `Rates start from each room type's base and move with KL demand, occupancy on the books and room-type pickup. Competitor guardrail: ${premiumTxt}. All thresholds are in RULES (shared/app.js).`),
+      notes.length ? h('div', { class: 'callout warn' }, 'Heads-up: ' + notes.join(' · ') + '. Those steps were skipped for those dates — upload the latest files in the Upload tab.') : null,
+      h('div', { class: 'card', style: { padding: 0 } }, h('div', { class: 'rates-wrap' }, table)),
+      reason);
+  }
+
+  /* =================================================================
+     OTA RATINGS
+     ================================================================= */
+  function renderRatings(root) {
+    const propSel = ORD.propertySelect('ratings-prop', prop, (v) => { setProp(v); load(); });
+    const month = h('input', { type: 'month', id: 'ratings-month', value: monthValue(D.today()) });
+    month.addEventListener('change', () => load());
+    const out = h('div');
+    root.append(
+      h('div', { class: 'filters' }, field('Hotel', propSel), field('Month', month)),
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('div', null, h('h2', null, 'Review ratings'),
+          h('p', null, 'Enter your hotel and competitors as shown on each platform. Ratings are compared on a 10-point scale.'))),
+        out));
+
+    async function load(notice) {
+      out.style.opacity = '0.5';
+      try {
+        const code = propSel.value, m = monthIso(month.value);
+        const p = ORD.propByCode[code];
+        const latest = await ORD.q(ORD.db.from('competitor_rates').select('snapshot_date').eq('property_code', code).order('snapshot_date', { ascending: false }).limit(1));
+        const [all, comps] = await Promise.all([
+          ORD.q(ORD.db.from('ota_ratings').select('*').eq('property_code', code).lte('month', m).order('month', { ascending: false }).limit(1000)),
+          latest[0] ? ORD.selectAll(() => ORD.db.from('competitor_rates').select('hotel_name').eq('property_code', code).eq('is_own', false).eq('snapshot_date', latest[0].snapshot_date).order('hotel_name')) : Promise.resolve([]),
+        ]);
+        // sample ratings are shown as grey placeholders, never pre-filled, so saving never turns them into real data
+        const thisMonth = all.filter((r) => r.month === m && !r.is_sample);
+        const previous = all.filter((r) => r.month < m || r.is_sample);
+        const names = [];
+        const addName = (n) => { if (n && n !== p.name && !names.includes(n)) names.push(n); };
+        all.filter((r) => !r.is_own).forEach((r) => addName(r.hotel_name));
+        comps.forEach((r) => addName(r.hotel_name));
+        draw(code, m, p, names, thisMonth, previous, notice);
+      } catch (e) { ORD.fill(out, errBox(e)); }
+      finally { out.style.opacity = ''; }
+    }
+
+    function draw(code, m, p, names, thisMonth, previous, notice) {
+      const scales = {};
+      ORD.PLATFORMS.forEach((pl) => {
+        const ex = thisMonth.find((r) => r.platform === pl) || previous.find((r) => r.platform === pl);
+        const s = h('select', { 'aria-label': pl + ' scale' }, h('option', { value: '10' }, 'out of 10'), h('option', { value: '5' }, 'out of 5'));
+        s.value = ex ? String(+ex.scale) : '10';
+        scales[pl] = s;
+      });
+      const inputs = []; // {hotel, isOwn, platform, input, existing}
+      const tbody = h('tbody');
+      const addRow = (hotel, isOwn) => {
+        const tds = ORD.PLATFORMS.map((pl) => {
+          const ex = thisMonth.find((r) => r.platform === pl && r.hotel_name === hotel);
+          const last = previous.find((r) => r.platform === pl && r.hotel_name === hotel);
+          const inp = h('input', { type: 'number', step: '0.1', min: '0', max: '10', value: ex ? String(+ex.rating) : '', placeholder: last ? String(+last.rating) : '', 'aria-label': `${hotel} ${pl} rating` });
+          inputs.push({ hotel, isOwn, platform: pl, input: inp, existing: ex || null });
+          return h('td', null, inp);
+        });
+        tbody.append(h('tr', null, h('td', null, h('b', { text: hotel }), isOwn ? h('span', { class: 'badge info', style: { marginLeft: '6px' } }, 'You') : null), tds));
+      };
+      addRow(p.name, true);
+      names.forEach((n) => addRow(n, false));
+      const newName = h('input', { type: 'text', placeholder: 'Competitor name', 'aria-label': 'New competitor name' });
+      const addBtn = h('button', { class: 'btn small' }, 'Add competitor');
+      addBtn.addEventListener('click', () => { const n = newName.value.trim(); if (n && !inputs.some((x) => x.hotel === n)) { addRow(n, false); newName.value = ''; } });
+      const copyBtn = h('button', { class: 'btn small' }, 'Fill empty boxes with last month');
+      copyBtn.addEventListener('click', () => inputs.forEach((x) => { if (!x.input.value && x.input.placeholder) x.input.value = x.input.placeholder; }));
+      const save = h('button', { class: 'btn primary' }, 'Save ratings');
+      const msg = h('div', { class: 'msg' + (notice ? ' ok' : ''), role: 'status', text: notice || '' });
+      save.addEventListener('click', async () => {
+        save.disabled = true; msg.className = 'msg'; msg.textContent = 'Saving…';
+        try {
+          const up = [], del = [];
+          for (const x of inputs) {
+            const v = ORD.toNum(x.input.value);
+            const scale = +scales[x.platform].value;
+            if (v == null) { if (x.existing) del.push(x.existing.id); continue; }
+            if (v < 0 || v > scale) throw new Error(`${x.hotel} on ${x.platform}: ${v} is outside 0–${scale}.`);
+            up.push({ property_code: code, month: m, platform: x.platform, hotel_name: x.hotel, is_own: x.isOwn, rating: v, scale, is_sample: false });
+          }
+          if (up.length) await ORD.upsertChunks('ota_ratings', up, 'property_code,month,platform,hotel_name');
+          if (del.length) await ORD.q(ORD.db.from('ota_ratings').delete().in('id', del));
+          const r = await ORD.loadRatings(code, m);
+          ORD.toast('Ratings saved.');
+          load(`Saved ${up.length} ratings.` + (r && r.gap != null ? ` Your average ${r.ownAvg.toFixed(2)} vs compset ${r.compAvg.toFixed(2)} (${r.gap >= 0 ? '+' : ''}${r.gap.toFixed(2)}).` : ''));
+        } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+        finally { save.disabled = false; }
+      });
+      ORD.fill(out, 
+        h('div', { class: 'table-wrap' }, h('table', null,
+          h('thead', null,
+            h('tr', null, h('th', null, 'Hotel'), ORD.PLATFORMS.map((pl) => h('th', { text: pl }))),
+            h('tr', null, h('th', { class: 'muted' }, 'Scale'), ORD.PLATFORMS.map((pl) => h('th', null, scales[pl])))),
+          tbody)),
+        h('div', { class: 'row', style: { marginTop: '12px' } }, newName, addBtn, copyBtn),
+        h('div', { class: 'row', style: { marginTop: '12px' } }, save, msg),
+        names.length ? null : h('p', { class: 'small muted', style: { marginTop: '8px' } }, 'Tip: competitors from your Lighthouse uploads appear here automatically.'));
+    }
+    load();
+  }
+
+  /* =================================================================
+     ROOM TYPES
+     ================================================================= */
+  function renderRooms(root) {
+    const propSel = ORD.propertySelect('rooms-prop', prop, (v) => { setProp(v); draw(); });
+    const out = h('div', { class: 'stack' });
+    root.append(h('div', { class: 'filters' }, field('Hotel', propSel)), out);
+
+    async function draw() {
+      const code = propSel.value;
+      const p = ORD.propByCode[code];
+      const total = h('input', { type: 'number', min: '1', value: String(p.total_rooms), style: { width: '120px' }, 'aria-label': 'Total rooms' });
+      const saveP = h('button', { class: 'btn' }, 'Save');
+      saveP.addEventListener('click', async () => {
+        const v = Math.round(ORD.toNum(total.value));
+        if (!(v > 0)) return ORD.toast('Total rooms must be above 0.', true);
+        try { await ORD.q(ORD.db.from('properties').update({ total_rooms: v }).eq('code', code).select()); await ORD.loadReference(); ORD.toast('Total rooms saved.'); }
+        catch (e) { ORD.toast(e.message, true); }
+      });
+      const rts = ORD.roomTypesFor(code);
+      const rowsEls = rts.map((rt) => {
+        const num = (v, label) => h('input', { type: 'number', min: '0', step: '1', value: v == null ? '' : String(+v), 'aria-label': `${rt.name} ${label}` });
+        const el = { rt, rooms: num(rt.rooms, 'rooms'), base: num(rt.base_rate, 'base rate'), min: num(rt.min_rate, 'minimum rate'), max: num(rt.max_rate, 'maximum rate'), active: h('input', { type: 'checkbox', checked: rt.active, 'aria-label': rt.name + ' active' }) };
+        el.tr = h('tr', null, h('td', null, h('b', { text: rt.name })), h('td', null, el.rooms), h('td', null, el.base), h('td', null, el.min), h('td', null, el.max), h('td', null, el.active));
+        return el;
+      });
+      const saveAll = h('button', { class: 'btn primary' }, 'Save room types');
+      const msg = h('div', { class: 'msg', role: 'status' });
+      saveAll.addEventListener('click', async () => {
+        saveAll.disabled = true; msg.className = 'msg'; msg.textContent = 'Saving…';
+        try {
+          let changed = 0;
+          for (const el of rowsEls) {
+            const v = { rooms: el.rooms.value === '' ? null : Math.round(ORD.toNum(el.rooms.value)), base_rate: ORD.toNum(el.base.value), min_rate: ORD.toNum(el.min.value), max_rate: ORD.toNum(el.max.value), active: el.active.checked };
+            if (!(v.base_rate > 0) || v.min_rate == null || v.max_rate == null) throw new Error(`${el.rt.name}: base, min and max are required.`);
+            if (!(v.min_rate <= v.base_rate && v.base_rate <= v.max_rate)) throw new Error(`${el.rt.name}: needs min ≤ base ≤ max.`);
+            const rt = el.rt;
+            if (v.rooms === (rt.rooms == null ? null : +rt.rooms) && v.base_rate === +rt.base_rate && v.min_rate === +rt.min_rate && v.max_rate === +rt.max_rate && v.active === rt.active) continue;
+            await ORD.q(ORD.db.from('room_types').update(v).eq('id', rt.id).select());
+            changed++;
+          }
+          await ORD.loadReference();
+          msg.className = 'msg ok'; msg.textContent = changed ? `Saved ${changed} room type${changed === 1 ? '' : 's'}. Rates update straight away.` : 'Nothing changed.';
+        } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+        finally { saveAll.disabled = false; }
+      });
+
+      // add room type
+      const nName = h('input', { type: 'text', placeholder: 'Room type name (as in eZee)', 'aria-label': 'New room type name' });
+      const nBase = h('input', { type: 'number', placeholder: 'Base RM', style: { width: '110px' }, 'aria-label': 'New room type base rate' });
+      const addBtn = h('button', { class: 'btn' }, 'Add room type');
+      const addRoomType = async (name, base) => {
+        if (!name || !(base > 0)) return ORD.toast('Enter a name and a base rate.', true);
+        const r5 = (x) => ORD.roundTo(x, 5);
+        try {
+          await ORD.q(ORD.db.from('room_types').insert({ property_code: code, name, base_rate: base, min_rate: r5(base * 0.7), max_rate: r5(base * 1.6), sort: 99 }).select());
+          await ORD.loadReference(); ORD.toast(`${name} added.`); draw();
+        } catch (e) { ORD.toast(e.message, true); }
+      };
+      addBtn.addEventListener('click', () => addRoomType(nName.value.trim(), ORD.toNum(nBase.value)));
+
+      const seen = h('div');
+      ORD.fill(out, 
+        h('div', { class: 'card' },
+          h('div', { class: 'card-head' }, h('div', null, h('h2', null, p.name), h('p', null, 'eZee name: ' + p.ezee_name))),
+          h('div', { class: 'row' }, field('Total rooms (for occupancy when eZee data is missing)', total), h('div', { style: { alignSelf: 'flex-end' } }, saveP))),
+        h('div', { class: 'card' },
+          h('div', { class: 'card-head' }, h('div', null, h('h2', null, 'Room types & rate limits'),
+            h('p', null, 'Base rates start from your Sep 2026 ADR — adjust them to your current BAR. Rooms (inventory) unlock room-type RevPAR and occupancy.'))),
+          h('div', { class: 'table-wrap' }, h('table', null,
+            h('thead', null, h('tr', null, ['Room type', 'Rooms', 'Base RM', 'Min RM', 'Max RM', 'Active'].map((x) => h('th', { text: x })))),
+            h('tbody', null, rowsEls.map((e) => e.tr)))),
+          h('div', { class: 'row', style: { marginTop: '12px' } }, saveAll, msg),
+          h('div', { class: 'row', style: { marginTop: '16px' } }, nName, nBase, addBtn)),
+        seen);
+
+      // room types seen in uploads but not set up
+      try {
+        const used = await ORD.q(ORD.db.from('v_room_type_month').select('room_type,adr,month').eq('property_code', code).order('month', { ascending: false }).limit(500));
+        const known = new Set(rts.map((r) => ORD.norm(r.name)));
+        const missing = {};
+        used.forEach((u) => { if (u.room_type && !known.has(ORD.norm(u.room_type)) && !missing[u.room_type]) missing[u.room_type] = u.adr; });
+        const list = Object.entries(missing);
+        if (list.length) {
+          ORD.fill(seen, h('div', { class: 'card' },
+            h('div', { class: 'card-head' }, h('div', null, h('h2', null, 'Found in your reservation uploads'), h('p', null, 'These room types are not set up yet, so they get no rate recommendation.'))),
+            h('table', null, h('tbody', null, list.map(([name, adr]) => h('tr', null,
+              h('td', { text: name }), h('td', { class: 'num', text: 'Latest ADR ' + fmt.rm(adr) }),
+              h('td', null, h('button', { class: 'btn small', onclick: () => addRoomType(name, ORD.roundTo(+adr || 100, 5)) }, 'Add with base ' + fmt.rm(ORD.roundTo(+adr || 100, 5))))))))));
+        } else ORD.fill(seen);
+      } catch (e) { ORD.fill(seen); }
+    }
+    draw();
+  }
+
+  /* =================================================================
+     SETTINGS
+     ================================================================= */
+  function renderSettings(root) {
+    const cfg = ORD.config;
+    const srcBadge = (s, optional) => s === 'vercel' ? h('span', { class: 'badge good' }, '✓ Found (Vercel)')
+      : s === 'browser' ? h('span', { class: 'badge info' }, '✓ Found (this browser)')
+        : h('span', { class: 'badge ' + (optional ? 'warn' : 'bad') }, optional ? '! Missing (optional)' : '✕ Missing');
+    const checklist = h('ul', { class: 'checklist' },
+      h('li', null, h('div', null, h('code', null, 'SUPABASE_URL'), h('div', { class: 'small muted' }, 'Supabase Project URL — public')), srcBadge(cfg.source.SUPABASE_URL)),
+      h('li', null, h('div', null, h('code', null, 'SUPABASE_ANON_KEY'), h('div', { class: 'small muted' }, 'Publishable (or anon) key — public')), srcBadge(cfg.source.SUPABASE_ANON_KEY)),
+      h('li', null, h('div', null, h('code', null, 'GEMINI_API_KEY'), h('div', { class: 'small muted' }, 'AI strategy write-up — secret, optional')), srcBadge(cfg.source.GEMINI_API_KEY, true)));
+
+    const disconnect = h('button', { class: 'btn' }, 'Change Supabase connection');
+    disconnect.addEventListener('click', () => { ORD.store.set(ORD.KEYS.url, ''); ORD.store.set(ORD.KEYS.key, ''); location.reload(); });
+    const retest = h('button', { class: 'btn' }, 'Test connection');
+    const tmsg = h('div', { class: 'msg', role: 'status' });
+    retest.addEventListener('click', async () => { const r = await ORD.testConnection(cfg.supabaseUrl, cfg.supabaseKey); tmsg.className = 'msg ' + (r.ok ? 'ok' : 'err'); tmsg.textContent = r.message; });
+
+    // Gemini key (browser, demo only)
+    const gKey = h('input', { type: 'password', id: 'gemini-key', placeholder: 'AIza…', value: ORD.store.get(ORD.KEYS.gemini), autocomplete: 'off' });
+    const gModel = h('input', { type: 'text', id: 'gemini-model', placeholder: 'gemini-flash-latest', value: ORD.store.get(ORD.KEYS.model) });
+    const gSave = h('button', { class: 'btn primary' }, 'Save in this browser');
+    const gClear = h('button', { class: 'btn' }, 'Clear');
+    gSave.addEventListener('click', () => { ORD.store.set(ORD.KEYS.gemini, gKey.value.trim()); ORD.store.set(ORD.KEYS.model, gModel.value.trim()); ORD.toast('Saved in this browser.'); ORD.loadConfig().then(render); });
+    gClear.addEventListener('click', () => { ORD.store.set(ORD.KEYS.gemini, ''); ORD.store.set(ORD.KEYS.model, ''); ORD.toast('Cleared.'); ORD.loadConfig().then(render); });
+
+    // Sample data
+    const sample = h('div');
+    const log = h('div');
+    root.append(h('div', { class: 'grid grid-2' },
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', null, 'Required keys')),
+        cfg.warning ? h('div', { class: 'callout bad' }, cfg.warning) : null,
+        checklist,
+        h('p', { class: 'small muted', style: { marginTop: '10px' } }, 'Connected to ', h('code', { text: cfg.supabaseUrl })),
+        h('div', { class: 'row', style: { marginTop: '8px' } }, retest, cfg.source.SUPABASE_URL === 'browser' ? disconnect : null),
+        tmsg),
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', null, 'Gemini API key (optional)')),
+        cfg.source.GEMINI_API_KEY === 'vercel'
+          ? h('div', { class: 'callout good' }, 'GEMINI_API_KEY is set on Vercel — AI write-ups run on the server. Nothing to paste here.')
+          : h('div', null,
+            h('div', { class: 'callout warn' }, 'Demo only: a key pasted here is stored in this browser (localStorage). Never paste a secret key on a shared computer. For real use, add GEMINI_API_KEY in Vercel › Settings › Environment Variables.'),
+            h('div', { class: 'form-grid' }, field('Gemini API key', gKey), field('Model (optional)', gModel)),
+            h('div', { class: 'row' }, gSave, gClear),
+            h('p', { class: 'small muted', style: { marginTop: '8px' } }, 'Get a free key at aistudio.google.com › Get API key. Only aggregated figures are sent — never guest-level data.')))),
+    h('div', { class: 'grid grid-2', style: { marginTop: '16px' } },
+      h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('div', null, h('h2', null, 'Sample data'), h('p', null, 'Seeded so the dashboard is not empty. Your own uploads are never touched.'))), sample),
+      h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Upload log')), log)));
+    drawSample(sample);
+    loadLog(log);
+  }
+
+  async function drawSample(el) {
+    const tables = ['reservations', 'daily_stats', 'competitor_rates', 'market_demand', 'ota_ratings'];
+    try {
+      const counts = await Promise.all(tables.map(async (t) => {
+        const { count, error } = await ORD.db.from(t).select('*', { count: 'exact', head: true }).eq('is_sample', true);
+        if (error) throw new Error(error.message);
+        return count || 0;
+      }));
+      const total = counts.reduce((a, b) => a + b, 0);
+      const btn = h('button', { class: 'btn danger', disabled: !total }, 'Remove sample data');
+      let armed = false;
+      btn.addEventListener('click', async () => {
+        if (!armed) { armed = true; btn.textContent = 'Click again to remove ' + fmt.int(total) + ' sample rows'; return; }
+        btn.disabled = true; btn.textContent = 'Removing…';
+        try {
+          for (const t of tables) await ORD.q(ORD.db.from(t).delete().eq('is_sample', true));
+          ORD.toast('Sample data removed.');
+        } catch (e) { ORD.toast(e.message, true); }
+        drawSample(el);
+      });
+      ORD.fill(el, 
+        h('table', null, h('tbody', null, tables.map((t, i) => h('tr', null, h('td', { text: t }), h('td', { class: 'num', text: fmt.int(counts[i]) + ' rows' }))))),
+        h('div', { class: 'row', style: { marginTop: '12px' } }, btn, total ? null : h('span', { class: 'badge good' }, 'No sample data left')));
+    } catch (e) { ORD.fill(el, errBox(e)); }
+  }
+})();
+</script>
+</body>
+</html>

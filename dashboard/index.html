@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard · Opus Revenue Desk</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%231c5cab%22/%3E%3Ctext x=%2216%22 y=%2222%22 font-size=%2218%22 font-family=%22Arial%22 font-weight=%22700%22 fill=%22white%22 text-anchor=%22middle%22%3EO%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/shared/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.6.1/dist/chart.umd.min.js"></script>
+  <script src="/shared/app.js"></script>
+</head>
+<body>
+<main class="wrap" id="main"><div class="empty"><b>Loading…</b></div></main>
+<script>
+(function () {
+  'use strict';
+  const { h, fmt } = ORD;
+  const D = ORD.date;
+  const main = document.getElementById('main');
+  let prop = ORD.store.get('ord.prop');
+  let month = D.monthStart(D.today());
+  let data = null;
+  const els = {};
+
+  ORD.boot({ page: 'dashboard', main, onReady: init });
+
+  const card = (title, sub, ...body) => h('div', { class: 'card' },
+    h('div', { class: 'card-head' }, h('div', null, h('h2', null, title), sub ? h('p', null, sub) : null)), ...body);
+  const errBox = (e) => h('div', { class: 'callout bad' }, 'Could not load: ' + (e && e.message ? e.message : e));
+  const lineKey = (color, label, dashed) => h('span', null, h('i', { class: dashed ? 'dash' : null, style: { borderColor: color } }), label);
+
+  async function init() {
+    if (!ORD.propByCode[prop]) prop = ORD.properties[0].code;
+    // month options from the data range (plus this month)
+    let first = D.monthStart(D.today()), last = first;
+    try {
+      const [a, b] = await Promise.all([
+        ORD.q(ORD.db.from('daily_stats').select('stay_date').order('stay_date', { ascending: true }).limit(1)),
+        ORD.q(ORD.db.from('daily_stats').select('stay_date').order('stay_date', { ascending: false }).limit(1)),
+      ]);
+      if (a[0] && a[0].stay_date < first) first = D.monthStart(a[0].stay_date);
+      if (b[0] && b[0].stay_date > last) last = D.monthStart(b[0].stay_date);
+    } catch (e) { /* fall back to this month */ }
+    const months = [];
+    for (let m = last; m >= first && months.length < 36; m = D.addMonths(m, -1)) months.push(m);
+
+    const propSel = ORD.propertySelect('dash-prop', prop, (v) => { prop = v; ORD.store.set('ord.prop', v); refresh(); });
+    const monthSel = h('select', { id: 'dash-month' }, months.map((m) => h('option', { value: m }, fmt.month(m))));
+    monthSel.value = month;
+    monthSel.addEventListener('change', () => { month = monthSel.value; refresh(); });
+    els.propSel = propSel;
+
+    els.portfolio = h('div', { class: 'portfolio' });
+    els.kpis = h('div', { class: 'grid grid-4' });
+    els.occ = h('div'); els.adr = h('div');
+    els.rooms = h('div'); els.nats = h('div');
+    els.comp = h('div'); els.ota = h('div'); els.strategy = h('div');
+
+    ORD.fill(main, 
+      h('div', { class: 'page-head' }, h('div', null, h('h1', null, 'Dashboard'),
+        h('p', null, 'Room revenue figures follow eZee: complimentary rooms count as occupied, revenue excludes tax.'))),
+      h('div', { class: 'filters' },
+        h('label', { class: 'field', for: 'dash-prop' }, 'Hotel', propSel),
+        h('label', { class: 'field', for: 'dash-month' }, 'Month', monthSel)),
+      els.portfolio,
+      els.kpis,
+      h('div', { class: 'grid grid-2', style: { marginTop: '16px' } },
+        card('Occupancy vs KL market demand', 'Daily · dashed = still on the books', els.occ),
+        card('ADR and RevPAR', 'Daily, RM', els.adr)),
+      h('div', { class: 'grid grid-2', style: { marginTop: '16px' } },
+        card('Which room type brings the most?', 'Room revenue from the reservation list, this month', els.rooms),
+        card('Which nationality pays the highest ADR?', `Nationalities with at least ${ORD.RULES.nationalityMinNights} room nights this month`, els.nats)),
+      h('div', { style: { marginTop: '16px' } },
+        card('What are competitors doing?', 'Next 30 days · latest Lighthouse Rate Insight upload', els.comp)),
+      h('div', { class: 'grid grid-2', style: { marginTop: '16px' } },
+        card('Where do you stand on the OTAs?', 'Latest ratings entered (Home › OTA ratings), 10-point scale', els.ota),
+        card('Strategy write-up', 'Built from everything on this page', els.strategy)));
+    ORD.onThemeChange = () => { if (data) drawAll(); };
+    refresh();
+  }
+
+  async function refresh() {
+    main.style.opacity = '0.6';
+    try {
+      data = await loadData(prop, month);
+      drawAll();
+    } catch (e) {
+      ORD.fill(els.kpis, errBox(e));
+    } finally {
+      main.style.opacity = '';
+    }
+  }
+
+  /* ---------------- data ---------------- */
+  async function loadData(code, m) {
+    const db = ORD.db;
+    const end = D.monthEnd(m);
+    const today = D.today();
+    const compEnd = D.add(today, 29);
+
+    const latestSnap = await ORD.q(db.from('competitor_rates').select('snapshot_date').eq('property_code', code).order('snapshot_date', { ascending: false }).limit(1));
+    const snap = latestSnap[0] ? latestSnap[0].snapshot_date : null;
+    const prevSnapRows = snap ? await ORD.q(db.from('competitor_rates').select('snapshot_date').eq('property_code', code).lt('snapshot_date', snap).order('snapshot_date', { ascending: false }).limit(1)) : [];
+    const prevSnap = prevSnapRows[0] ? prevSnapRows[0].snapshot_date : null;
+    const snaps = [snap, prevSnap].filter(Boolean);
+
+    const [daily, demand, rooms, nats, comp, ratings, history] = await Promise.all([
+      ORD.q(db.from('daily_stats').select('*').gte('stay_date', m).lte('stay_date', end).order('stay_date')),
+      ORD.q(db.from('v_demand_latest').select('stay_date,demand_pct').gte('stay_date', m).lte('stay_date', end)),
+      ORD.q(db.from('v_room_type_month').select('*').eq('property_code', code).eq('month', m).order('revenue', { ascending: false })),
+      ORD.q(db.from('v_nationality_month').select('*').eq('property_code', code).eq('month', m).order('adr', { ascending: false })),
+      snaps.length ? ORD.selectAll(() => db.from('competitor_rates').select('snapshot_date,stay_date,hotel_name,is_own,channel,rate,is_sold_out')
+        .eq('property_code', code).in('snapshot_date', snaps).gte('stay_date', today).lte('stay_date', compEnd).order('stay_date')) : Promise.resolve([]),
+      ORD.loadRatings(code, m),
+      ORD.q(db.from('ai_summaries').select('*').eq('property_code', code).order('created_at', { ascending: false }).limit(6)),
+    ]);
+    return { code, month: m, end, today, daily, demand, rooms, nats, comp, snap, prevSnap, ratings, history, compStart: today, compEnd };
+  }
+
+  /* ---------------- derived figures ---------------- */
+  function compSummary(dat) {
+    const latest = dat.comp.filter((r) => r.snapshot_date === dat.snap);
+    const prev = dat.comp.filter((r) => r.snapshot_date === dat.prevSnap);
+    const dates = D.range(dat.compStart, dat.compEnd);
+    const hotels = [...new Set(latest.filter((r) => !r.is_own).map((r) => r.hotel_name))].sort();
+    const own = {}, comps = {}, med = {};
+    // lowest rate per hotel per date (across channels)
+    const lowest = (rows) => {
+      const out = {};
+      rows.forEach((r) => {
+        const k = r.stay_date + '|' + r.hotel_name;
+        if (!out[k]) out[k] = { ...r };
+        else if (r.rate != null && (out[k].rate == null || +r.rate < +out[k].rate)) out[k] = { ...r };
+      });
+      return Object.values(out);
+    };
+    const L = lowest(latest), P = lowest(prev);
+    L.forEach((r) => {
+      if (r.is_own) own[r.stay_date] = r.rate == null ? null : +r.rate;
+      else (comps[r.hotel_name] = comps[r.hotel_name] || {})[r.stay_date] = r.rate == null ? null : +r.rate;
+    });
+    dates.forEach((d) => { med[d] = ORD.median(hotels.map((x) => (comps[x] || {})[d])); });
+    const prevBy = {};
+    P.forEach((r) => { prevBy[r.stay_date + '|' + r.hotel_name] = r.rate == null ? null : +r.rate; });
+    const ownName = (L.find((r) => r.is_own) || {}).hotel_name;
+    const table = hotels.map((x) => {
+      const vals = dates.map((d) => (comps[x] || {})[d]).filter((v) => v != null);
+      const gaps = dates.map((d) => (own[d] != null && (comps[x] || {})[d] != null ? (comps[x][d] / own[d] - 1) : null)).filter((v) => v != null);
+      const changes = dates.map((d) => { const a = prevBy[d + '|' + x], b = (comps[x] || {})[d]; return a != null && b != null ? b / a - 1 : null; }).filter((v) => v != null);
+      const soldOut = L.filter((r) => r.hotel_name === x && r.rate == null && r.is_sold_out).length;
+      return { hotel: x, avg: ORD.mean(vals), gap: ORD.mean(gaps), change: changes.length ? ORD.mean(changes) : null, soldOut };
+    });
+    const ownVals = dates.map((d) => own[d]).filter((v) => v != null);
+    const idxPairs = dates.filter((d) => own[d] != null && med[d] != null);
+    const priceIndex = idxPairs.length ? ORD.mean(idxPairs.map((d) => own[d] / med[d])) * 100 : null;
+    const ownChange = (() => {
+      const ch = dates.map((d) => { const a = prevBy[d + '|' + ownName], b = own[d]; return a != null && b != null ? b / a - 1 : null; }).filter((v) => v != null);
+      return ch.length ? ORD.mean(ch) : null;
+    })();
+    return { dates, hotels, own, comps, med, table, ownAvg: ORD.mean(ownVals), priceIndex, ownChange, ownName };
+  }
+
+  function verdict(gap, idx) {
+    if (gap == null) return { text: 'Add competitor ratings to compare', cls: '' };
+    if (idx == null) return gap >= 0.3 ? { text: 'Rated above compset', cls: 'good' } : gap <= -0.3 ? { text: 'Rated below compset', cls: 'bad' } : { text: 'In line with compset', cls: '' };
+    if (gap >= 0.3 && idx < 100) return { text: 'Rated above compset but priced below median → room to raise rates', cls: 'good' };
+    if (gap >= 0.3) return { text: 'Premium price backed by stronger ratings', cls: 'good' };
+    if (gap <= -0.3 && idx > 100) return { text: 'Priced above compset with weaker ratings → conversion risk', cls: 'bad' };
+    if (gap <= -0.3) return { text: 'Weaker ratings — improve reviews before raising rates', cls: 'warn' };
+    return { text: 'In line with compset', cls: '' };
+  }
+
+  /* ---------------- drawing ---------------- */
+  function drawAll() {
+    drawPortfolio();
+    drawKpis();
+    drawDaily();
+    drawRooms();
+    drawNats();
+    data.compSum = compSummary(data);
+    drawComp();
+    drawOta();
+    drawStrategy();
+  }
+
+  function drawPortfolio() {
+    ORD.fill(els.portfolio, ...ORD.properties.map((p) => {
+      const k = ORD.kpisFromDaily(data.daily.filter((r) => r.property_code === p.code));
+      const c = h('div', { class: 'card' + (p.code === prop ? ' sel' : ''), role: 'button', tabindex: '0', 'aria-pressed': String(p.code === prop) },
+        h('h3', { text: p.name }),
+        k.days ? h('div', { class: 'mini' },
+          h('div', null, h('b', { text: fmt.pct(k.occ) }), h('span', null, 'Occ')),
+          h('div', null, h('b', { text: fmt.rm(k.adr) }), h('span', null, 'ADR')),
+          h('div', null, h('b', { text: fmt.rm(k.revpar) }), h('span', null, 'RevPAR')),
+          h('div', null, h('b', { text: fmt.rm(k.revenue) }), h('span', null, 'Room revenue')))
+          : h('p', { class: 'small muted', style: { margin: '6px 0 0' } }, 'No eZee data for this month'));
+      const pick = () => { prop = p.code; ORD.store.set('ord.prop', prop); els.propSel.value = prop; refresh(); };
+      c.addEventListener('click', pick);
+      c.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+      return c;
+    }));
+  }
+
+  function drawKpis() {
+    const rows = data.daily.filter((r) => r.property_code === data.code);
+    const k = ORD.kpisFromDaily(rows);
+    if (!k.days) {
+      ORD.fill(els.kpis, h('div', { class: 'card', style: { gridColumn: '1 / -1' } },
+        ORD.empty(`No eZee data for ${ORD.propByCode[data.code].name} in ${fmt.month(data.month)}`, 'Upload the eZee Monthly Statistics export in Home › Upload.')));
+      return;
+    }
+    const future = rows.filter((r) => r.stay_date >= data.today).length;
+    const sample = rows.some((r) => r.is_sample);
+    const sub = `${k.days} days` + (future ? ` · ${future} still on the books` : ' · actual') + (sample ? ' · sample data' : '');
+    const tile = (label, value, s) => h('div', { class: 'card kpi' }, h('span', { class: 'label', text: label }), h('span', { class: 'value', text: value }), h('span', { class: 'sub', text: s }));
+    ORD.fill(els.kpis, 
+      tile('Room revenue', fmt.rm(k.revenue), sub),
+      tile('Occupancy', fmt.pct(k.occ, 2), `${fmt.int(k.occupied)} of ${fmt.int(k.available)} room nights`),
+      tile('ADR', fmt.rm2(k.adr), 'Room revenue ÷ occupied rooms'),
+      tile('RevPAR', fmt.rm2(k.revpar), 'Room revenue ÷ available rooms'));
+  }
+
+  function drawDaily() {
+    const rows = data.daily.filter((r) => r.property_code === data.code);
+    if (!rows.length) {
+      ORD.fill(els.occ, ORD.empty('No daily data', 'Upload the eZee Monthly Statistics export.'));
+      ORD.fill(els.adr, ORD.empty('No daily data', 'Upload the eZee Monthly Statistics export.'));
+      return;
+    }
+    const days = D.range(data.month, data.end);
+    const by = Object.fromEntries(rows.map((r) => [r.stay_date, r]));
+    const dem = Object.fromEntries(data.demand.map((r) => [r.stay_date, +r.demand_pct]));
+    const occ = days.map((d) => { const r = by[d]; return r && +r.available_rooms > 0 ? ((+r.nights_sold || 0) + (+r.complimentary || 0)) / +r.available_rooms * 100 : null; });
+    const adr = days.map((d) => { const r = by[d]; const o = r ? (+r.nights_sold || 0) + (+r.complimentary || 0) : 0; return r && o ? +r.room_charges / o : null; });
+    const revpar = days.map((d) => { const r = by[d]; return r && +r.available_rooms > 0 ? +r.room_charges / +r.available_rooms : null; });
+    const demand = days.map((d) => (dem[d] != null ? dem[d] : null));
+    const futureFrom = days.findIndex((d) => d >= data.today);
+    const dashFuture = { borderDash: (ctx) => (futureFrom >= 0 && ctx.p1DataIndex > futureFrom ? [5, 4] : undefined) };
+    const s1 = ORD.css('--series-1'), s2 = ORD.css('--series-2');
+    const labels = days.map((d) => fmt.dayShort(d));
+    const lineDs = (label, values, color) => ({ label, data: values, borderColor: color, backgroundColor: color, borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, spanGaps: false, tension: 0.25, segment: dashFuture });
+    const common = (yFmt) => ({
+      interaction: { mode: 'index', intersect: false },
+      plugins: { tooltip: { callbacks: { title: (it) => fmt.day(days[it[0].dataIndex]), label: (c) => ` ${c.dataset.label}: ${c.parsed.y == null ? '—' : yFmt(c.parsed.y)}` } } },
+      scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 8, autoSkip: true, maxRotation: 0 } }, y: { beginAtZero: true, ticks: { callback: yFmt } } },
+    });
+
+    const c1 = h('canvas', { role: 'img', 'aria-label': 'Daily occupancy and KL market demand' });
+    const hasDemand = demand.some((v) => v != null);
+    ORD.fill(els.occ, 
+      h('div', { class: 'legend' }, lineKey(s1, 'Your occupancy'), hasDemand ? lineKey(s2, 'KL market demand (Lighthouse)') : h('span', { class: 'muted' }, 'No KL demand uploaded for this month')),
+      h('div', { class: 'chart-box' }, c1));
+    const o1 = common((v) => Math.round(v) + '%');
+    o1.scales.y.max = 100;
+    ORD.makeChart('occ', c1, { type: 'line', data: { labels, datasets: [lineDs('Occupancy', occ, s1), hasDemand ? lineDs('KL demand', demand, s2) : null].filter(Boolean) }, options: o1 });
+
+    const c2 = h('canvas', { role: 'img', 'aria-label': 'Daily ADR and RevPAR' });
+    ORD.fill(els.adr, h('div', { class: 'legend' }, lineKey(s1, 'ADR'), lineKey(s2, 'RevPAR')), h('div', { class: 'chart-box' }, c2));
+    ORD.makeChart('adr', c2, { type: 'line', data: { labels, datasets: [lineDs('ADR', adr, s1), lineDs('RevPAR', revpar, s2)] }, options: common((v) => 'RM ' + Math.round(v)) });
+  }
+
+  function hbar(id, labels, values, label, fmtV) {
+    const cv = h('canvas', { role: 'img', 'aria-label': label });
+    const color = ORD.css('--series-1');
+    const box = h('div', { class: 'chart-box', style: { height: Math.max(140, labels.length * 30 + 40) + 'px' } }, cv);
+    setTimeout(() => ORD.makeChart(id, cv, {
+      type: 'bar',
+      data: { labels, datasets: [{ label, data: values, backgroundColor: color, borderRadius: 4, borderSkipped: 'start', maxBarThickness: 18 }] },
+      options: {
+        indexAxis: 'y',
+        plugins: { tooltip: { callbacks: { label: (c) => ` ${label}: ${fmtV(c.parsed.x)}` } } },
+        scales: { x: { beginAtZero: true, ticks: { callback: fmtV, maxTicksLimit: 5 } }, y: { grid: { display: false }, ticks: { autoSkip: false, callback: function (v) { const s = this.getLabelForValue(v); return s.length > 28 ? s.slice(0, 27) + '…' : s; } } } },
+      },
+    }), 0);
+    return box;
+  }
+
+  function drawRooms() {
+    const r = data.rooms;
+    if (!r.length) {
+      ORD.fill(els.rooms, ORD.empty('No reservations for this month', 'Upload the eZee reservation list in Home › Upload.'));
+      return;
+    }
+    const top = r[0];
+    const bestRevpar = r.slice().sort((a, b) => (+b.revpar_contribution || 0) - (+a.revpar_contribution || 0))[0];
+    const hasRooms = r.some((x) => x.rooms);
+    ORD.fill(els.rooms, 
+      h('div', { class: 'callout' }, h('b', { text: top.room_type }), ` brings ${fmt.share(top.revenue_share)} of room revenue (${fmt.rm(top.revenue)}, ADR ${fmt.rm(top.adr)}).`,
+        bestRevpar && bestRevpar.room_type !== top.room_type ? ` Highest RevPAR contribution: ${bestRevpar.room_type}.` : ''),
+      hbar('rooms', r.map((x) => x.room_type), r.map((x) => +x.revenue), 'Room revenue', (v) => 'RM ' + fmt.int(v)),
+      h('div', { class: 'table-wrap', style: { marginTop: '10px' } }, h('table', { class: 'compact' },
+        h('thead', null, h('tr', null, ['Room type', 'Room nights', 'Revenue', 'Share', 'ADR', 'RevPAR contribution', hasRooms ? 'Room-type RevPAR' : null, hasRooms ? 'Room-type occ.' : null].filter(Boolean).map((x, i) => h('th', { class: i ? 'num' : null, text: x })))),
+        h('tbody', null, r.map((x) => h('tr', null,
+          h('td', { text: x.room_type }), h('td', { class: 'num', text: fmt.int(x.room_nights) }), h('td', { class: 'num', text: fmt.rm(x.revenue) }),
+          h('td', { class: 'num', text: fmt.share(x.revenue_share) }), h('td', { class: 'num', text: fmt.rm(x.adr) }), h('td', { class: 'num', text: fmt.rm2(x.revpar_contribution) }),
+          hasRooms ? h('td', { class: 'num', text: x.rooms ? fmt.rm2(x.room_type_revpar) : '—' }) : null,
+          hasRooms ? h('td', { class: 'num', text: x.rooms ? fmt.share(x.room_type_occ) : '—' }) : null)))),
+        hasRooms ? null : h('p', { class: 'small muted', style: { marginTop: '6px' } }, 'RevPAR contribution = room-type revenue ÷ all available room nights (they add up to hotel RevPAR). Enter room counts in Home › Room types for room-type RevPAR and occupancy.')));
+  }
+
+  function drawNats() {
+    const all = data.nats;
+    if (!all.length) {
+      ORD.fill(els.nats, ORD.empty('No reservations for this month', 'Upload the eZee reservation list in Home › Upload.'));
+      return;
+    }
+    const min = ORD.RULES.nationalityMinNights;
+    const q = all.filter((x) => x.room_nights >= min && x.nationality !== 'Unknown').sort((a, b) => b.adr - a.adr);
+    const byRev = all.slice().sort((a, b) => b.revenue - a.revenue)[0];
+    const unknown = all.find((x) => x.nationality === 'Unknown');
+    const top = q.slice(0, 10);
+    ORD.fill(els.nats, 
+      q.length ? h('div', { class: 'callout' }, 'Highest ADR: ', h('b', { text: `${q[0].nationality} ${fmt.rm(q[0].adr)}` }), ` (${q[0].room_nights} room nights). Biggest revenue market: ${byRev.nationality} (${fmt.share(byRev.revenue_share)}).`)
+        : h('div', { class: 'callout warn' }, `No nationality has ${min}+ room nights this month yet.`),
+      unknown && unknown.revenue_share > 0.2 ? h('div', { class: 'callout warn' }, `${fmt.share(unknown.revenue_share)} of revenue has no nationality in eZee — OTA bookings often arrive without it.`) : null,
+      top.length ? hbar('nats', top.map((x) => x.nationality), top.map((x) => +x.adr), 'ADR', (v) => 'RM ' + fmt.int(v)) : null,
+      h('div', { class: 'table-wrap', style: { marginTop: '10px' } }, h('table', { class: 'compact' },
+        h('thead', null, h('tr', null, ['Nationality', 'Room nights', 'Revenue', 'Share', 'ADR'].map((x, i) => h('th', { class: i ? 'num' : null, text: x })))),
+        h('tbody', null, all.slice().sort((a, b) => b.adr - a.adr).map((x) => h('tr', { class: x.room_nights < min ? 'muted' : null },
+          h('td', { text: x.nationality + (x.room_nights < min ? ' (few nights)' : '') }), h('td', { class: 'num', text: fmt.int(x.room_nights) }),
+          h('td', { class: 'num', text: fmt.rm(x.revenue) }), h('td', { class: 'num', text: fmt.share(x.revenue_share) }), h('td', { class: 'num', text: fmt.rm(x.adr) })))))));
+  }
+
+  function drawComp() {
+    const s = data.compSum;
+    if (!data.snap || !s.hotels.length) {
+      ORD.fill(els.comp, ORD.empty('No competitor rates for the next 30 days', 'Upload a Lighthouse Rate Insight export in Home › Upload.'));
+      return;
+    }
+    const s1 = ORD.css('--series-1'), s2 = ORD.css('--series-2'), ctx = ORD.css('--context');
+    const labels = s.dates.map((d) => fmt.dayShort(d));
+    const cv = h('canvas', { role: 'img', 'aria-label': 'Your rate vs competitors, next 30 days' });
+    const movers = s.table.filter((x) => x.change != null).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
+    const bits = [];
+    if (s.priceIndex != null) bits.push(`Your rate averages ${Math.round(s.priceIndex)}% of the compset median (price index ${Math.round(s.priceIndex)}).`);
+    if (movers[0] && Math.abs(movers[0].change) >= 0.005) bits.push(`${movers[0].hotel} ${movers[0].change > 0 ? 'raised' : 'cut'} rates ${fmt.signed(movers[0].change, 1).replace(/^[+−]/, '')} on average since the ${fmt.dateLong(data.prevSnap)} upload.`);
+    const soldOut = s.table.filter((x) => x.soldOut > 0);
+    if (soldOut.length) bits.push(`Sold-out dates: ${soldOut.map((x) => `${x.hotel} (${x.soldOut})`).join(', ')}.`);
+    const ds = [
+      ...s.hotels.map((x) => ({ label: x, data: s.dates.map((d) => (s.comps[x] || {})[d] ?? null), borderColor: ctx, backgroundColor: ctx, borderWidth: 1, pointRadius: 0, pointHoverRadius: 3, tension: 0.2, order: 3 })),
+      { label: 'Compset median', data: s.dates.map((d) => s.med[d]), borderColor: s2, backgroundColor: s2, borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.2, borderDash: [6, 4], order: 2 },
+      { label: s.ownName ? `Your rate (${s.ownName})` : 'Your rate', data: s.dates.map((d) => s.own[d] ?? null), borderColor: s1, backgroundColor: s1, borderWidth: 2.5, pointRadius: 0, pointHoverRadius: 4, tension: 0.2, order: 1 },
+    ];
+    ORD.fill(els.comp, 
+      bits.length ? h('div', { class: 'callout' }, bits.join(' ')) : null,
+      h('div', { class: 'legend' }, lineKey(s1, 'Your rate'), lineKey(s2, 'Compset median', true), lineKey(ctx, 'Each competitor')),
+      h('div', { class: 'chart-box tall' }, cv),
+      h('div', { class: 'table-wrap', style: { marginTop: '12px' } }, h('table', null,
+        h('thead', null, h('tr', null, ['Competitor', 'Avg rate, next 30 days', 'vs your rate', 'Change since last upload', 'Sold-out days'].map((x, i) => h('th', { class: i ? 'num' : null, text: x })))),
+        h('tbody', null,
+          h('tr', null, h('td', null, h('b', { text: s.ownName || 'Your hotel' }), h('span', { class: 'badge info', style: { marginLeft: '6px' } }, 'You')),
+            h('td', { class: 'num', text: fmt.rm(s.ownAvg) }), h('td', { class: 'num', text: '—' }), h('td', { class: 'num', text: s.ownChange == null ? '—' : fmt.signed(s.ownChange, 1) }), h('td', { class: 'num', text: '—' })),
+          s.table.slice().sort((a, b) => (b.avg || 0) - (a.avg || 0)).map((x) => h('tr', null,
+            h('td', { text: x.hotel }), h('td', { class: 'num', text: fmt.rm(x.avg) }),
+            h('td', { class: 'num', text: x.gap == null ? '—' : fmt.signed(x.gap, 1) }),
+            h('td', { class: 'num', text: x.change == null ? '—' : fmt.signed(x.change, 1) }),
+            h('td', { class: 'num', text: fmt.int(x.soldOut) })))))),
+      h('p', { class: 'small muted', style: { marginTop: '6px' } }, `Latest upload: ${fmt.dateLong(data.snap)}` + (data.prevSnap ? ` · compared with ${fmt.dateLong(data.prevSnap)}` : ' · upload another snapshot later to see changes')));
+    ORD.makeChart('comp', cv, {
+      type: 'line',
+      data: { labels, datasets: ds },
+      options: {
+        interaction: { mode: 'index', intersect: false },
+        plugins: { tooltip: { itemSort: (a, b) => (b.parsed.y || 0) - (a.parsed.y || 0), callbacks: { title: (it) => fmt.day(s.dates[it[0].dataIndex]), label: (c) => ` ${c.dataset.label}: ${c.parsed.y == null ? 'sold out / no rate' : 'RM ' + fmt.int(c.parsed.y)}` } } },
+        scales: { x: { grid: { display: false }, ticks: { maxTicksLimit: 10, maxRotation: 0 } }, y: { ticks: { callback: (v) => 'RM ' + v } } },
+      },
+    });
+  }
+
+  function drawOta() {
+    const r = data.ratings;
+    if (!r || !Object.keys(r.platforms).length) {
+      ORD.fill(els.ota, ORD.empty('No ratings yet', 'Enter this month’s Agoda, Booking.com and Trip.com ratings in Home › OTA ratings.'));
+      return;
+    }
+    const idx = data.compSum ? data.compSum.priceIndex : null;
+    const rows = ORD.PLATFORMS.filter((pl) => r.platforms[pl]).map((pl) => ({ pl, ...r.platforms[pl], v: verdict(r.platforms[pl].gap, idx) }));
+    ORD.fill(els.ota, 
+      h('p', { class: 'small muted', style: { margin: '0 0 8px' } }, `Ratings for ${fmt.month(r.month)}` + (idx != null ? ` · price index ${Math.round(idx)} (your rate ÷ compset median, next 30 days)` : '')),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'compact' },
+        h('thead', null, h('tr', null, ['Platform', 'You', 'Compset avg', 'Gap', 'Rank', 'Verdict'].map((x, i) => h('th', { class: i && i < 5 ? 'num' : null, text: x })))),
+        h('tbody', null, rows.map((x) => h('tr', null,
+          h('td', null, h('b', { text: x.pl })),
+          h('td', { class: 'num', text: x.own == null ? '—' : x.own.toFixed(1) }),
+          h('td', { class: 'num', text: x.compAvg == null ? '—' : x.compAvg.toFixed(1) }),
+          h('td', { class: 'num', text: x.gap == null ? '—' : (x.gap >= 0 ? '+' : '−') + Math.abs(x.gap).toFixed(1) }),
+          h('td', { class: 'num', text: x.rank ? `${x.rank} of ${x.count}` : '—' }),
+          h('td', null, h('span', { class: 'badge wrap ' + x.v.cls, text: x.v.text }))))))),
+      r.gap != null ? h('p', { class: 'small ink2', style: { marginTop: '10px' } }, `Across the three OTAs you average ${r.ownAvg.toFixed(2)} vs the compset’s ${r.compAvg.toFixed(2)} (${r.gap >= 0 ? '+' : ''}${r.gap.toFixed(2)}). The rate tool uses this to set how far above the compset median you can price.`) : null);
+  }
+
+  /* ---------------- strategy ---------------- */
+  async function buildFacts() {
+    const p = ORD.propByCode[data.code];
+    const k = ORD.kpisFromDaily(data.daily.filter((r) => r.property_code === data.code));
+    const min = ORD.RULES.nationalityMinNights;
+    const nats = data.nats.filter((x) => x.room_nights >= min && x.nationality !== 'Unknown');
+    const s = data.compSum;
+    const start = data.today;
+    const inputs = await ORD.loadRateInputs(data.code, start, D.add(start, 13));
+    const recs = ORD.computeRecommendations(data.code, inputs, start, 14);
+    let moves = [];
+    if (!recs.error) {
+      moves = recs.dates.map((d, i) => {
+        const cells = recs.rows.map((r) => r.cells[i]);
+        const lead = recs.rows.find((r) => r.roomType.id === recs.lead.id).cells[i];
+        return { date: d, avgChange: ORD.mean(cells.map((c) => c.change)), leadRate: lead.rate, reasons: lead.reasons };
+      });
+    }
+    const up = moves.filter((m) => m.avgChange > 0.02).sort((a, b) => b.avgChange - a.avgChange).slice(0, 4);
+    const down = moves.filter((m) => m.avgChange < -0.02).sort((a, b) => a.avgChange - b.avgChange).slice(0, 4);
+    return {
+      hotel: p.name, month: fmt.month(data.month), currency: 'RM',
+      kpis: k.days ? { occupancy_pct: +k.occ.toFixed(1), adr: Math.round(k.adr), revpar: Math.round(k.revpar), room_revenue: Math.round(k.revenue), days_still_on_books: data.daily.filter((r) => r.property_code === data.code && r.stay_date >= data.today).length } : null,
+      room_types: data.rooms.map((x) => ({ room_type: x.room_type, room_nights: x.room_nights, revenue: Math.round(x.revenue), share_pct: +(x.revenue_share * 100).toFixed(1), adr: Math.round(x.adr), revpar_contribution: +(+x.revpar_contribution).toFixed(2) })),
+      nationalities_by_adr: nats.slice(0, 6).map((x) => ({ nationality: x.nationality, room_nights: x.room_nights, adr: Math.round(x.adr), share_pct: +(x.revenue_share * 100).toFixed(1) })),
+      top_revenue_markets: data.nats.slice().sort((a, b) => b.revenue - a.revenue).slice(0, 4).map((x) => ({ nationality: x.nationality, share_pct: +(x.revenue_share * 100).toFixed(1) })),
+      competitors_next_30_days: s && s.hotels.length ? {
+        your_avg_rate: s.ownAvg && Math.round(s.ownAvg), price_index_vs_median: s.priceIndex && Math.round(s.priceIndex),
+        competitors: s.table.map((x) => ({ hotel: x.hotel, avg_rate: x.avg && Math.round(x.avg), gap_vs_you_pct: x.gap == null ? null : +(x.gap * 100).toFixed(1), change_since_last_upload_pct: x.change == null ? null : +(x.change * 100).toFixed(1), sold_out_days: x.soldOut })),
+      } : null,
+      ota_ratings: data.ratings ? ORD.PLATFORMS.filter((pl) => data.ratings.platforms[pl]).map((pl) => { const x = data.ratings.platforms[pl]; return { platform: pl, you: x.own && +x.own.toFixed(1), compset_avg: x.compAvg && +x.compAvg.toFixed(1), rank: x.rank, of: x.count }; }) : null,
+      pricing_next_14_days: {
+        raise: up.map((m) => ({ date: fmt.day(m.date), avg_change_pct: Math.round(m.avgChange * 100), cheapest_room_rate: m.leadRate, why: m.reasons.slice(0, 3) })),
+        lower: down.map((m) => ({ date: fmt.day(m.date), avg_change_pct: Math.round(m.avgChange * 100), cheapest_room_rate: m.leadRate, why: m.reasons.slice(0, 3) })),
+      },
+    };
+  }
+
+  function rulesSummary(f) {
+    const L = [];
+    L.push(`## ${f.hotel} — ${f.month}`);
+    if (f.kpis) L.push(`- Occupancy **${f.kpis.occupancy_pct}%**, ADR **RM ${fmt.int(f.kpis.adr)}**, RevPAR **RM ${fmt.int(f.kpis.revpar)}**, room revenue RM ${fmt.int(f.kpis.room_revenue)}` + (f.kpis.days_still_on_books ? ` (${f.kpis.days_still_on_books} days still on the books).` : '.'));
+    else L.push('- No eZee Monthly Statistics uploaded for this month yet.');
+    if (f.room_types.length) {
+      const t = f.room_types[0], last = f.room_types[f.room_types.length - 1];
+      L.push('## Room types');
+      L.push(`- **${t.room_type}** brings ${t.share_pct}% of room revenue at ADR RM ${fmt.int(t.adr)} — protect its availability on peak dates.`);
+      if (f.room_types.length > 1) L.push(`- Smallest contributor: ${last.room_type} (${last.share_pct}%). Consider packaging or upsell offers to lift it.`);
+    }
+    if (f.nationalities_by_adr.length) {
+      const n = f.nationalities_by_adr[0];
+      L.push('## Markets');
+      L.push(`- Highest ADR: **${n.nationality} RM ${fmt.int(n.adr)}** (${n.room_nights} room nights). Target this market in OTA campaigns and direct promotions.`);
+      if (f.top_revenue_markets[0]) L.push(`- Biggest revenue market: ${f.top_revenue_markets[0].nationality} (${f.top_revenue_markets[0].share_pct}% of revenue).`);
+    }
+    if (f.competitors_next_30_days) {
+      const c = f.competitors_next_30_days;
+      L.push('## Competitors (next 30 days)');
+      if (c.price_index_vs_median != null) L.push(`- Your rate averages ${c.price_index_vs_median}% of the compset median${c.price_index_vs_median < 95 ? ' — you are the value option; check whether that is deliberate.' : c.price_index_vs_median > 110 ? ' — you are priced at a premium; watch conversion.' : '.'}`);
+      const mv = c.competitors.filter((x) => x.change_since_last_upload_pct != null).sort((a, b) => Math.abs(b.change_since_last_upload_pct) - Math.abs(a.change_since_last_upload_pct))[0];
+      if (mv && Math.abs(mv.change_since_last_upload_pct) >= 0.5) L.push(`- ${mv.hotel} ${mv.change_since_last_upload_pct > 0 ? 'raised' : 'cut'} rates ${Math.abs(mv.change_since_last_upload_pct)}% since the previous upload.`);
+      const so = c.competitors.filter((x) => x.sold_out_days > 0);
+      if (so.length) L.push(`- Competitors sold out on some dates (${so.map((x) => x.hotel).join(', ')}) — hold rate on those nights.`);
+    }
+    if (f.ota_ratings && f.ota_ratings.length) {
+      L.push('## OTA positioning');
+      f.ota_ratings.forEach((o) => L.push(`- ${o.platform}: ${o.you ?? '—'} vs compset ${o.compset_avg ?? '—'}` + (o.rank ? ` (rank ${o.rank} of ${o.of})` : '')));
+    }
+    L.push('## Pricing actions — next 14 days');
+    if (f.pricing_next_14_days.raise.length) f.pricing_next_14_days.raise.forEach((m) => L.push(`- Raise **${m.date}** by about ${m.avg_change_pct}% (cheapest room RM ${fmt.int(m.cheapest_room_rate)}): ${m.why.join('; ')}.`));
+    if (f.pricing_next_14_days.lower.length) f.pricing_next_14_days.lower.forEach((m) => L.push(`- Lower / promote **${m.date}** (${m.avg_change_pct}%, cheapest room RM ${fmt.int(m.cheapest_room_rate)}): ${m.why.join('; ')}.`));
+    if (!f.pricing_next_14_days.raise.length && !f.pricing_next_14_days.lower.length) L.push('- No big moves — recommended rates stay close to base. See Home › Rates for every date.');
+    return L.join('\n');
+  }
+
+  function drawStrategy() {
+    const out = h('div');
+    const rulesBtn = h('button', { class: 'btn' }, 'Write strategy (rules)');
+    const aiBtn = h('button', { class: 'btn primary', disabled: !ORD.aiAvailable(), title: ORD.aiAvailable() ? null : 'Add a Gemini API key in Home › Settings' }, 'Write with AI');
+    const msg = h('div', { class: 'msg', role: 'status' });
+    const hist = h('ul', { class: 'history' }, data.history.map((x) => h('li', { tabindex: '0', onclick: () => show(x) },
+      `${new Date(x.created_at).toLocaleString('en-MY', { dateStyle: 'medium', timeStyle: 'short' })} · ${x.period_label || ''} · ${x.model === 'rules' ? 'Rules' : 'AI (' + x.model + ')'}`)));
+    function show(x) { ORD.fill(out, h('p', { class: 'small muted', style: { margin: '0 0 6px' } }, `${x.model === 'rules' ? 'Rules summary' : 'AI write-up (' + x.model + ')'} · ${new Date(x.created_at).toLocaleString('en-MY', { dateStyle: 'medium', timeStyle: 'short' })}`), ORD.renderMarkdown(x.content)); }
+    async function save(content, model) {
+      const row = { property_code: data.code, period_label: fmt.month(data.month), content, model };
+      try { const r = await ORD.q(ORD.db.from('ai_summaries').insert(row).select()); data.history.unshift(r[0] || { ...row, created_at: new Date().toISOString() }); }
+      catch (e) { ORD.toast('Write-up shown but not saved: ' + e.message, true); data.history.unshift({ ...row, created_at: new Date().toISOString() }); }
+      drawStrategy(); // re-renders and shows the newest write-up
+    }
+    rulesBtn.addEventListener('click', async () => {
+      rulesBtn.disabled = true; msg.className = 'msg'; msg.textContent = 'Working…';
+      try { const f = await buildFacts(); await save(rulesSummary(f), 'rules'); }
+      catch (e) { msg.className = 'msg err'; msg.textContent = e.message; rulesBtn.disabled = false; }
+    });
+    aiBtn.addEventListener('click', async () => {
+      aiBtn.disabled = true; msg.className = 'msg'; msg.textContent = 'Asking Gemini… (10–30 seconds)';
+      try {
+        const f = await buildFacts();
+        const system = 'You are an experienced hotel revenue manager for Opus Hospitality in Kuala Lumpur, Malaysia. Write a concise, practical strategy from the data provided only. Use RM for money. Use short markdown headings (##) and bullet points. Be specific about dates, room types and markets. Never invent figures that are not in the data; say when data is missing.';
+        const prompt = 'Data for the strategy (JSON):\n' + JSON.stringify(f, null, 1) +
+          '\n\nWrite these sections, 350 words maximum:\n## Headline (2 sentences)\n## Pricing actions — next 14 days (dates, room types, RM)\n## Room types and markets\n## Competitors and OTA positioning\n## Risks to watch';
+        const r = await ORD.callAI(system, prompt);
+        await save(r.text, r.model || ORD.config.geminiModel);
+      } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; aiBtn.disabled = !ORD.aiAvailable(); }
+    });
+    ORD.fill(els.strategy, 
+      h('div', { class: 'row' }, rulesBtn, aiBtn),
+      ORD.aiAvailable() ? null : h('p', { class: 'small muted', style: { margin: '8px 0 0' } }, 'AI write-up needs a Gemini key (Home › Settings). The rules summary always works.'),
+      msg,
+      h('div', { style: { marginTop: '12px' } }, out),
+      data.history.length ? h('div', { style: { marginTop: '12px' } }, h('h3', null, 'Earlier write-ups'), hist) : null);
+    if (data.history[0]) show(data.history[0]);
+    else ORD.fill(out, h('p', { class: 'muted' }, 'No write-up yet for this hotel.'));
+  }
+})();
+</script>
+</body>
+</html>
